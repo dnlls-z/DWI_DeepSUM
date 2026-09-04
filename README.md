@@ -8,7 +8,7 @@ DeepSUM-DWI is a TensorFlow 2 implementation of DeepSUM for repeated diffusion-w
 This project was funded by UNAM-PAPIIT grant: TA101224.
 
 ## Setup
-DeepSUM-DWI uses Tensorflow 2.20. The full requirements can be found in the requirements.txt file. It is recommended to follow the official TensorFlow installation instructions when GPU support or platform-specific setup is needed: https://www.tensorflow.org/install/pip 
+DeepSUM-DWI uses Tensorflow 2.20. It is recommended to follow the official TensorFlow installation instructions when GPU support or platform-specific setup is needed: https://www.tensorflow.org/install/pip 
 
 ## Workflow
 1. Open `master_scripts/I_config_custom.ipynb`. Set the project paths, input MATLAB file, run nickname, split parameters, and patch size, then run all cells. This creates or updates a versioned configuration in `runs/<nickname>/config_files/`.
