@@ -18,8 +18,10 @@ DeepSUM-DWI uses Tensorflow 2.20. The full requirements can be found in the requ
 The input MATLAB file must contain dwi_lr, dwi_hr, mask_lr, mask_hr, and norm_value arrays. Run configuration files record the input path, output dataset/test-set directories, number of repetitions (T_in), scale (R), image size, normalization statistics, and train/test split.
 
 Dataset creation and inference can also be run from the project root:
-```python CD.py --config config_rd_12sj_9r_s3_v1.json
-python SR.py --config-path config_rd_12sj_9r_s3_v1.json --project-root global_files```
+
+```python CD.py --config config_rd_12sj_9r_s3_v1.json```
+
+```python SR.py --config-path config_rd_12sj_9r_s3_v1.json --project-root global_files```
 
 `SR.py` restores the matching checkpoint from `global_files/checkpoints/`, writes MATLAB outputs, previews, and image-quality metrics. Use `--out-dir`, `--image-index`, `--no-png`, or `--no-mat` to adjust inference output.
 
