@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from scipy.io import savemat
+from scipy.ndimage import binary_erosion
 from skimage.metrics import (
     mean_squared_error as mse,
     normalized_root_mse as nrmse,
@@ -76,12 +77,39 @@ def build_model_config(data: dict[str, Any], config_path: str | Path) -> default
     config["mu"] = pick_config_value(data, "mu")
     config["sigma"] = pick_config_value(data, "sigma")
     config["sigma_rescaled"] = pick_config_value(data, "sigma_rescaled")
-    config["metric_crop_border"] = int(
-        pick_config_value(data, "metric_crop_border", default=config["border"], required=False)
+
+    config["brightness_bias_weight"] = float(
+        pick_config_value(data, "brightness_bias_weight")
     )
-    config["metric_data_range"] = float(
-        pick_config_value(data, "metric_data_range", default=65535.0, required=False)
+
+    config["raw_intensity_loss_weight"] = float(
+        pick_config_value(data, "raw_intensity_loss_weight")
     )
+
+    crop_border = pick_config_value(
+        data, "metric_crop_border", default=config["border"], required=False
+    )
+    if (
+        isinstance(crop_border, bool)
+        or int(crop_border) != crop_border
+        or crop_border < 0
+    ):
+        raise ValueError("metric_crop_border must be a non-negative integer.")
+    config["metric_crop_border"] = int(crop_border)
+
+    value = pick_config_value(
+        data, "metric_data_range", default=None, required=False
+    )
+    config["metric_data_range"] = (
+        None if value is None else float(value)
+    )
+
+    if config["metric_data_range"] is not None:
+        if (
+            not np.isfinite(config["metric_data_range"])
+            or config["metric_data_range"] <= 0
+        ):
+            raise ValueError("metric_data_range must be finite and positive.")
     config["metric_nrmse_normalization"] = str(
         pick_config_value(data, "metric_nrmse_normalization", default="min-max", required=False)
     )
@@ -221,9 +249,18 @@ def save_preview_images(sr_images, lr_test, hr_test, image_index: int, out_dir: 
     sr = sr_images[image_index, 0, :, :, 0]
     lr = lr_test[image_index][0]
     hr = hr_test[image_index]
-    for name, arr in [("SR", sr), ("LR", lr), ("HR", hr)]:
+
+    vmin = float(np.min(hr))
+    vmax = float(np.max(hr))
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+
+    for name, arr in [("SR", sr), ("LR_first_repeat", lr), ("HR", hr)]:
         plt.figure(figsize=[8, 8])
-        plt.imshow(arr, cmap="gray", interpolation="none")
+        plt.imshow(
+            arr, cmap="gray", interpolation="none",
+            vmin=vmin, vmax=vmax,
+        )
         plt.xticks([])
         plt.yticks([])
         plt.tight_layout()
@@ -239,23 +276,137 @@ def save_mat_files(sr_images, lr_test, hr_test, out_dir: Path) -> None:
     print(".mat files saved in:", out_dir)
 
 
+def calculate_image_metrics(
+    hr,
+    sr,
+    *,
+    data_range,
+    nrmse_normalization,
+    mask=None,
+):
+    if np.iscomplexobj(hr) or np.iscomplexobj(sr):
+        raise ValueError("Metric inputs must be real images.")
+
+    hr = np.asarray(hr, dtype=np.float64)
+    sr = np.asarray(sr, dtype=np.float64)
+
+    if hr.ndim != 2 or sr.shape != hr.shape:
+        raise ValueError("HR and SR must be matching 2D images.")
+    if not np.isfinite(hr).all() or not np.isfinite(sr).all():
+        raise ValueError("Metric inputs contain NaN or infinity.")
+
+    if mask is None:
+        mask = np.ones(hr.shape, dtype=bool)
+    else:
+        mask = np.asarray(mask)
+        if (
+            mask.shape != hr.shape
+            or not np.isfinite(mask).all()
+            or not np.isin(mask, [0, 1]).all()
+        ):
+            raise ValueError("The mask must be binary and match HR/SR.")
+        mask = mask.astype(bool)
+
+    if not mask.any():
+        raise ValueError("The metric mask is empty.")
+
+    reference = hr[mask]
+    prediction = sr[mask]
+    error = prediction - reference
+    mse_value = float(np.mean(error ** 2))
+    rmse_value = float(np.sqrt(mse_value))
+
+    if nrmse_normalization == "euclidean":
+        denominator = float(np.sqrt(np.mean(reference ** 2)))
+    elif nrmse_normalization == "min-max":
+        denominator = float(np.ptp(reference))
+    elif nrmse_normalization == "mean":
+        denominator = float(np.abs(np.mean(reference)))
+    else:
+        raise ValueError("Unknown NRMSE normalization.")
+
+    nrmse_value = (
+        rmse_value / denominator
+        if denominator > 0 else float("nan")
+    )
+    psnr_value = float("nan")
+    ssim_value = float("nan")
+    n_ssim_windows = 0
+
+    if data_range is not None:
+        data_range = float(data_range)
+        if not np.isfinite(data_range) or data_range <= 0:
+            raise ValueError("data_range must be finite and positive.")
+
+        psnr_value = (
+            float("inf") if mse_value == 0
+            else float(
+                20 * np.log10(data_range)
+                - 10 * np.log10(mse_value)
+            )
+        )
+
+        if min(hr.shape) >= 7:
+            valid_centers = binary_erosion(
+                mask,
+                structure=np.ones((7, 7), dtype=bool),
+                border_value=0,
+            )
+            n_ssim_windows = int(valid_centers.sum())
+
+            if n_ssim_windows > 0:
+                _, ssim_map = ssim(
+                    hr, sr,
+                    data_range=data_range,
+                    win_size=7,
+                    gaussian_weights=False,
+                    use_sample_covariance=True,
+                    channel_axis=None,
+                    full=True,
+                )
+                ssim_value = float(
+                    np.mean(ssim_map[valid_centers])
+                )
+
+    return {
+        "SSIM": ssim_value,
+        "PSNR_dB": psnr_value,
+        "MSE": mse_value,
+        "RMSE": rmse_value,
+        "NRMSE": nrmse_value,
+        "MAE": float(np.mean(np.abs(error))),
+        "signed_bias_SR_minus_HR": float(np.mean(error)),
+        "n_pixels": int(mask.sum()),
+        "n_ssim_windows": n_ssim_windows,
+    }
+
+
 def compute_single_image_metrics(
     sr_images,
     hr_test,
-    image_index: int,
-    crop_border: int,
-    metric_data_range: float,
-    nrmse_normalization: str,
-) -> None:
-    sr = center_crop_2d(to_2d(sr_images[image_index, 0, :, :, 0]), crop_border)
-    hr = center_crop_2d(to_2d(hr_test[image_index]), crop_border)
-    print(f"SSIM value for image {image_index}: {ssim(hr, sr, data_range=metric_data_range):.4f}")
-    print(f"PSNR value for image {image_index}: {psnr(hr, sr, data_range=metric_data_range):.4f} dB")
-    print(f"MSE value for image {image_index}: {mse(hr, sr):.4f}")
-    print(
-        f"NRMSE value for image {image_index}: "
-        f"{nrmse(hr, sr, normalization=nrmse_normalization):.4f}"
+    image_index,
+    crop_border,
+    metric_data_range,
+    nrmse_normalization,
+    mask=None,
+):
+    sr = center_crop_2d(
+        to_2d(sr_images[image_index, 0, :, :, 0]), crop_border
     )
+    hr = center_crop_2d(
+        to_2d(hr_test[image_index]), crop_border
+    )
+    if mask is not None:
+        mask = center_crop_2d(to_2d(mask), crop_border)
+
+    values = calculate_image_metrics(
+        hr, sr,
+        data_range=metric_data_range,
+        nrmse_normalization=nrmse_normalization,
+        mask=mask,
+    )
+    for name, value in values.items():
+        print(f"{name} for image {image_index}: {value}")
 
 
 def save_all_metrics_and_pngs(
@@ -268,6 +419,7 @@ def save_all_metrics_and_pngs(
     metric_data_range: float,
     nrmse_normalization: str,
     save_png: bool = True,
+    masks=None,
 ):
     sr_dir = out_dir / "SR"
     lr_dir = out_dir / "LR_test"
@@ -280,17 +432,35 @@ def save_all_metrics_and_pngs(
         sr = center_crop_2d(to_2d(sr_images[i, 0, :, :, 0]), crop_border)
         lr = to_2d(lr_test[i][0])
         hr = center_crop_2d(to_2d(hr_test[i]), crop_border)
-        rows.append({
-            "image_index": i,
-            "SSIM": float(ssim(hr, sr, data_range=metric_data_range)),
-            "PSNR_dB": float(psnr(hr, sr, data_range=metric_data_range)),
-            "MSE": float(mse(hr, sr)),
-            "NRMSE": float(nrmse(hr, sr, normalization=nrmse_normalization)),
-        })
+        mask_i = None
+        if masks is not None:
+            mask_i = center_crop_2d(to_2d(masks[i]), crop_border)
+
+        values = calculate_image_metrics(
+            hr, sr,
+            data_range=metric_data_range,
+            nrmse_normalization=nrmse_normalization,
+            mask=mask_i,
+        )
+        rows.append({"image_index": i, **values})
         if save_png:
-            plt.imsave(sr_dir / f"img_{i:03d}_SR.png", norm01(sr), cmap="gray")
-            plt.imsave(lr_dir / f"img_{i:03d}_LR.png", norm01(lr), cmap="gray")
-            plt.imsave(hr_dir / f"img_{i:03d}_HR.png", norm01(hr), cmap="gray")
+            vmin = float(np.min(hr))
+            vmax = float(np.max(hr))
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+
+            plt.imsave(
+                sr_dir / f"img_{i:03d}_SR.png",
+                sr, cmap="gray", vmin=vmin, vmax=vmax,
+            )
+            plt.imsave(
+                lr_dir / f"img_{i:03d}_LR_first_repeat.png",
+                lr, cmap="gray", vmin=vmin, vmax=vmax,
+            )
+            plt.imsave(
+                hr_dir / f"img_{i:03d}_HR.png",
+                hr, cmap="gray", vmin=vmin, vmax=vmax,
+            )
     df = pd.DataFrame(rows).sort_values("image_index").reset_index(drop=True)
     summary = pd.DataFrame({
         "metric": ["SSIM", "PSNR_dB", "MSE", "NRMSE"],
@@ -298,9 +468,13 @@ def save_all_metrics_and_pngs(
         "std": [df["SSIM"].std(ddof=1), df["PSNR_dB"].std(ddof=1), df["MSE"].std(ddof=1), df["NRMSE"].std(ddof=1)],
     })
     excel_path = out_dir / excel_name
+    df.to_csv(
+        excel_path.with_suffix(".csv"),
+        index=False,
+    )
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="metrics", index=False)
-        summary.to_excel(writer, sheet_name="summary", index=False)
+        summary.to_excel(writer, sheet_name="image_level_descriptive", index=False)
     print("Procedure completed")
     print(f"Excel: {excel_path}")
     print(f"SR Images: {sr_dir}")
@@ -335,6 +509,7 @@ def run_superresolve(
     testset = Path(testset_path).expanduser().resolve() if testset_path is not None else Path(pick_config_value(data, "testset_path")).expanduser().resolve()
     output = Path(out_dir).expanduser().resolve() if out_dir is not None else resolve_output_dir(data, project, config)
     checkpoint = resolve_checkpoint_dir(data, project, config)
+    config["checkpoint_dir"] = str(checkpoint)
     resolved_n_slide = n_slide if n_slide is not None else pick_config_value(data, "n_slide", default=0, required=False)
     resolved_save_png = save_png if save_png is not None else bool(pick_config_value(data, "save_png", default=True, required=False))
     resolved_save_mat = save_mat if save_mat is not None else bool(pick_config_value(data, "save_mat", default=True, required=False))
@@ -361,8 +536,68 @@ def run_superresolve(
     print("Model built successfully")
     print("Running predict_test...")
     sr_images = model.predict_test(str(testset) + "/", n_slide=resolved_n_slide)
+    np.save(
+        output / "super_resolved_images.npy",
+        sr_images,
+        allow_pickle=False,
+    )
     print("super_resolved_images shape:", sr_images.shape)
     lr_test, hr_test = load_test_arrays(testset, config["spectral_band"], config["nickname"])
+
+    mask_path = pick_config_value(
+        data, "metric_mask_path", default=None, required=False
+    )
+    masks = None
+
+    if mask_path is not None:
+        mask_path = Path(mask_path).expanduser()
+        if not mask_path.is_absolute():
+            mask_path = config_path.parent / mask_path
+        mask_path = mask_path.resolve()
+        masks = np.load(mask_path, allow_pickle=False)
+
+        # A shared [H, W] mask is allowed when appropriate.
+        if masks.ndim == 2:
+            masks = np.broadcast_to(
+                masks, (len(hr_test), *masks.shape)
+            )
+        if (
+            masks.ndim != 3
+            or len(masks) != len(hr_test)
+            or masks.shape[1:] != to_2d(hr_test[0]).shape
+        ):
+            raise ValueError("Metric masks must be [N,H,W] or shared [H,W].")
+        if not np.isfinite(masks).all() or not np.isin(masks, [0, 1]).all():
+            raise ValueError("Metric masks must be finite binary arrays.")
+    else:
+        print("No metric mask: using the full cropped field of view.")
+
+    if config["metric_data_range"] is None:
+        print("PSNR/SSIM omitted: metric_data_range is unset.")
+
+    with open(
+        output / "evaluation_metadata.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            {
+                "checkpoint_path": model.restored_checkpoint,
+                "checkpoint_step": model.restored_step,
+                "config_path": str(config_path),
+                "metric_mask_path": (
+                    None if mask_path is None else str(mask_path)
+                ),
+                "metric_crop_border": config["metric_crop_border"],
+                "metric_data_range": config["metric_data_range"],
+                "metric_nrmse_normalization": (
+                    config["metric_nrmse_normalization"]
+                ),
+            },
+            f,
+            indent=2,
+        )
+
     if image_index is not None:
         if 0 <= int(image_index) < sr_images.shape[0]:
             save_preview_images(sr_images, lr_test, hr_test, int(image_index), output)
@@ -373,6 +608,9 @@ def run_superresolve(
                 crop_border=config["metric_crop_border"],
                 metric_data_range=config["metric_data_range"],
                 nrmse_normalization=config["metric_nrmse_normalization"],
+                mask=(
+                    None if masks is None else masks[int(image_index)]
+                ),
             )
         else:
             print(f"Preview was not saved because image_index={image_index} is out of range.")
@@ -388,6 +626,7 @@ def run_superresolve(
         metric_data_range=config["metric_data_range"],
         nrmse_normalization=config["metric_nrmse_normalization"],
         save_png=resolved_save_png,
+        masks=masks,
     )
     print("Superresolve ran successfully")
     return {

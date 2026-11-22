@@ -20,7 +20,12 @@
         "SISRNet_pretrain_dir":"./pretraining_checkpoints/SISRNet/SISRNet_RESIDUAL_64filters_NIR_lr_5e-05_bsize_3",
         "mu":7754.664,
         "sigma":2316.3408,
-        "sigma_rescaled":596.982
+        "sigma_rescaled":596.982,
+        "brightness_bias_weight": 1.0,
+        "raw_intensity_loss_weight": 1.0,
+        "metric_data_range": null,
+        "metric_nrmse_normalization": "min-max",
+        "metric_mask_path": null
     }
 
 }

@@ -684,11 +684,59 @@ def load_testset_preprocesses(dl_config, path, band='NIR', how='best', num_image
 class SR_network(object):
     def __init__(self, config):
 
+        self.brightness_bias_weight = float(
+            config["brightness_bias_weight"]
+        )
+        self.raw_intensity_loss_weight = float(
+            config["raw_intensity_loss_weight"]
+        )
+
+        if (
+            not np.isfinite(self.brightness_bias_weight)
+            or not 0.0 <= self.brightness_bias_weight <= 1.0
+        ):
+            raise ValueError(
+                "brightness_bias_weight debe ser finito y estar "
+                "en el intervalo [0, 1]."
+            )
+
+        if (
+            not np.isfinite(self.raw_intensity_loss_weight)
+            or self.raw_intensity_loss_weight < 0.0
+        ):
+            raise ValueError(
+                "raw_intensity_loss_weight debe ser finito y >= 0."
+            )
+
+        print(
+            "Parametros efectivos de la perdida:",
+            f"brightness_bias_weight={self.brightness_bias_weight},",
+            f"raw_intensity_loss_weight={self.raw_intensity_loss_weight}",
+        )
+
         self.lr = config['lr']
         self.batch_size = config['batch_size']
         self.gstep = tf.Variable(0, dtype=tf.int32,
                                  trainable=False, name='global_step')
         self.tensorboard_dir = config['tensorboard_dir']
+
+        checkpoint_dir = (
+            config.get("checkpoint_dir")
+            or config.get("checkpoint_path")
+            or os.path.join("checkpoints", self.tensorboard_dir)
+        )
+
+        self.checkpoint_dir = os.path.abspath(
+            os.path.expanduser(checkpoint_dir)
+        )
+
+        self.checkpoint_prefix = os.path.join(
+            self.checkpoint_dir,
+            "model.ckpt",
+        )
+
+        self.restored_checkpoint = None
+        self.restored_step = None
 
         self.skip_step = config['skip_step']
 
@@ -729,11 +777,19 @@ class SR_network(object):
         self.sess = tf.compat.v1.Session(config=tf.compat.v1.ConfigProto(
             allow_soft_placement=True, gpu_options=gpu_options))
 
-        self.mu = config['mu']
-        self.sigma = config['sigma']
-        self.sigma_rescaled = config['sigma_rescaled']
-        self.brightness_bias_weight = float(config.get('brightness_bias_weight', 1.0))
-        self.raw_intensity_loss_weight = float(config.get('raw_intensity_loss_weight', 0.0))
+        self.mu = float(config["mu"])
+        self.sigma = float(config["sigma"])
+        self.sigma_rescaled = float(config["sigma_rescaled"])
+
+        if not all(np.isfinite(v) for v in (
+            self.mu, self.sigma, self.sigma_rescaled
+        )):
+            raise ValueError("Normalization statistics must be finite.")
+
+        if self.sigma <= 0 or self.sigma_rescaled <= 0:
+            raise ValueError(
+                "Normalization standard deviations must be positive."
+            )
 
     def placeholder(self):
 
@@ -1317,7 +1373,10 @@ class SR_network(object):
                     }
                                                     )
 
-                    train_writer.add_summary(summaries, global_step=step)
+                    train_writer.add_summary(
+                        summaries,
+                        global_step=step + 1,
+                    )
                     train_writer.flush()
 
                 else:
@@ -1331,45 +1390,107 @@ class SR_network(object):
 
                                          )
 
-                if (step + 1) % self.skip_step == 0:
-                    saver.save(self.sess, 'checkpoints/' + self.tensorboard_dir + '/' + 'model.ckpt', step)
+                # El optimizador ya completo una actualizacion.
+                step += 1
 
-                    print('Training Loss for a mini batch at step {0}: {1}'.format(step, l))
+                if step % self.skip_step == 0:
+                    self.last_checkpoint_path = saver.save(
+                        self.sess,
+                        self.checkpoint_prefix,
+                        global_step=self.gstep,
+                    )
 
+                    print(
+                        "Perdida del minibatch en el paso {0}: {1}"
+                        .format(step, l)
+                    )
                     self.eval_once(test_writer, epoch, step)
 
                 total_loss += l
                 n_batches += 1
-                step += 1
+
+    def _restore_latest_checkpoint(self, saver, required=False):
+        checkpoint = tf.train.latest_checkpoint(self.checkpoint_dir)
+
+        if checkpoint is None:
+            checkpoint_files_exist = (
+                os.path.isfile(
+                    os.path.join(self.checkpoint_dir, "checkpoint")
+                )
+                or bool(glob.glob(
+                    os.path.join(self.checkpoint_dir, "*.index")
+                ))
+                or bool(glob.glob(
+                    os.path.join(self.checkpoint_dir, "*.data-*")
+                ))
+            )
+
+            if required or checkpoint_files_exist:
+                raise FileNotFoundError(
+                    "No hay un checkpoint utilizable en "
+                    f"{self.checkpoint_dir}. Revisa el archivo "
+                    "checkpoint y sus archivos de datos."
+                )
+
+            print("No hay checkpoint. Entrenamiento desde cero.")
+            return None
+
+        # Un error de restauracion debe detener la ejecucion.
+        saver.restore(self.sess, checkpoint)
+
+        self.restored_checkpoint = checkpoint
+        self.restored_step = int(self.sess.run(self.gstep))
+
+        print(
+            f"Checkpoint restaurado: {checkpoint} "
+            f"(global_step={self.restored_step})"
+        )
+
+        return checkpoint
 
     def train(self, n_epochs):
+        if (
+            not isinstance(n_epochs, (int, np.integer))
+            or n_epochs <= 0
+        ):
+            raise ValueError("n_epochs debe ser un entero positivo.")
 
-        safe_mkdir('checkpoints')
-        safe_mkdir('checkpoints/' + self.tensorboard_dir)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-        train_writer = tf.compat.v1.summary.FileWriter('./graphs/' + self.tensorboard_dir + '/train',
-                                                       tf.compat.v1.get_default_graph())
-        test_writer = tf.compat.v1.summary.FileWriter('./graphs/' + self.tensorboard_dir + '/test',
-                                                      tf.compat.v1.get_default_graph())
-        self.sess.run(tf.compat.v1.global_variables_initializer())
+        train_writer = tf.compat.v1.summary.FileWriter(
+            "./graphs/" + self.tensorboard_dir + "/train",
+            tf.compat.v1.get_default_graph(),
+        )
+        test_writer = tf.compat.v1.summary.FileWriter(
+            "./graphs/" + self.tensorboard_dir + "/test",
+            tf.compat.v1.get_default_graph(),
+        )
 
-        saver = tf.compat.v1.train.Saver()
-        ckpt = tf.train.get_checkpoint_state(os.path.dirname('checkpoints/' + self.tensorboard_dir + '/checkpoint'))
-        if ckpt and ckpt.model_checkpoint_path:
-            try:
-                print(f"Restoring from checkpoint: {ckpt.model_checkpoint_path}")
-                saver.restore(self.sess, ckpt.model_checkpoint_path)
-            except Exception as e:
-                print(f"Error restoring checkpoint: {e}")
-                print("Starting training from scratch.")
-        else:
-            print("No checkpoint found. Starting training from scratch.")
+        try:
+            self.sess.run(tf.compat.v1.global_variables_initializer())
+            saver = tf.compat.v1.train.Saver()
+            self._restore_latest_checkpoint(saver, required=False)
 
-        step = self.gstep.eval(session=self.sess)
-        for epoch in range(n_epochs):
-            step = self.train_one_epoch(saver, train_writer, test_writer, epoch, step)
+            step = int(self.sess.run(self.gstep))
 
-        return step
+            for epoch in range(n_epochs):
+                step = self.train_one_epoch(
+                    saver, train_writer, test_writer, epoch, step
+                )
+
+            # Guardar el ultimo estado de una ejecucion exitosa.
+            self.last_checkpoint_path = saver.save(
+                self.sess,
+                self.checkpoint_prefix,
+                global_step=self.gstep,
+            )
+            step = int(self.sess.run(self.gstep))
+            print("Checkpoint final:", self.last_checkpoint_path)
+            return step
+
+        finally:
+            train_writer.close()
+            test_writer.close()
 
 
     def eval(self):
@@ -1491,6 +1612,10 @@ class SR_network(object):
         hiresl_h = self.data_cfg.hiresl_h
         hiresl_w = self.data_cfg.hiresl_w
 
+        self.sess.run(tf.compat.v1.global_variables_initializer())
+        saver = tf.compat.v1.train.Saver()
+        self._restore_latest_checkpoint(saver, required=True)
+
         input_images_LR_test = np.load(
             os.path.join(
                 test_dir,
@@ -1515,19 +1640,47 @@ class SR_network(object):
             allow_pickle=True
         )
 
-        self.sess.run(tf.compat.v1.global_variables_initializer())
-        saver = tf.compat.v1.train.Saver()
-        ckpt = tf.train.get_checkpoint_state(os.path.dirname('checkpoints/' + self.tensorboard_dir + '/checkpoint'))
-        if ckpt and ckpt.model_checkpoint_path:
-            saver.restore(self.sess, ckpt.model_checkpoint_path)
+        if not (
+            len(input_images_LR_test)
+            == len(mask_LR_test)
+            == len(shift_LR_test)
+        ):
+            raise ValueError(
+                "Imagenes, mascaras y desplazamientos tienen "
+                "distinto numero de conjuntos."
+            )
+
+        if not isinstance(n_slide, (int, np.integer)) or n_slide < 0:
+            raise ValueError("n_slide debe ser un entero no negativo.")
 
         indexes = []
 
-        for image_set in mask_LR_test:
-            indexes.append(np.argsort(np.sum(np.array(image_set[0:]), axis=(1, 2)))[::-1])
+        for image_set_mask in mask_LR_test:
+            coverage = np.sum(
+                np.asarray(image_set_mask),
+                axis=(1, 2),
+            )
 
-        input_images_LR_test = [image_set[indexes_set] for image_set, indexes_set in zip(input_images_LR_test, indexes)]
-        mask_LR_test = np.array([image_set[indexes_set] for image_set, indexes_set in zip(mask_LR_test, indexes)])
+            # Conservar la referencia 0; ordenar solo las demas.
+            order = np.concatenate(
+                ([0], np.argsort(coverage[1:])[::-1] + 1)
+            )
+            indexes.append(order)
+
+        input_images_LR_test = [
+            np.asarray(image_set)[order]
+            for image_set, order in zip(input_images_LR_test, indexes)
+        ]
+
+        mask_LR_test = [
+            np.asarray(mask_set)[order]
+            for mask_set, order in zip(mask_LR_test, indexes)
+        ]
+
+        shift_LR_test = [
+            np.asarray(shift_set)[order]
+            for shift_set, order in zip(shift_LR_test, indexes)
+        ]
 
         SR_images = np.zeros([len(input_images_LR_test), 1, hiresl_h, hiresl_w, 1])
         for m in range(0, len(input_images_LR_test)):
@@ -1536,23 +1689,50 @@ class SR_network(object):
             imageset_mask = np.array(mask_LR_test[m])
             imageset_shift = np.array(shift_LR_test[m])
 
-            percentage = 0.9
-            while True:
-                indexes_0 = np.argwhere((np.sum(imageset_mask[0:], axis=(1, 2)) / (hiresl_h * hiresl_w)) > percentage).squeeze(
-                    axis=1)
-                indexes_0 = indexes_0 if indexes_0.ndim > 0 else np.array([])
+            if (
+                imageset.ndim != 3
+                or imageset_mask.shape != imageset.shape
+            ):
+                raise ValueError(
+                    "Imagenes y mascaras deben tener formas "
+                    "[repeticiones, H, W] coincidentes."
+                )
 
-                indexes = np.array(list(indexes_0))
-                if indexes.size >= 9:
-                    imageset = imageset[indexes]
-                    imageset_mask = imageset_mask[indexes]
-                    imageset_shift = imageset_shift[indexes]
+            if imageset_shift.shape != (len(imageset), 2):
+                raise ValueError(
+                    "Cada repeticion debe tener un desplazamiento 2D."
+                )
 
+            if len(imageset) < 9:
+                raise ValueError(
+                    "El modelo de nueve entradas recibio "
+                    f"solo {len(imageset)} repeticiones."
+                )
+
+            coverage = np.mean(imageset_mask, axis=(1, 2))
+
+            # Busqueda acotada con umbral decreciente.
+            for percentage in np.arange(90, -6, -5) / 100.0:
+                other = np.flatnonzero(
+                    coverage[1:] > percentage
+                ) + 1
+
+                if len(other) >= 8:
+                    selected = np.concatenate(([0], other))
                     break
-                else:
+            else:
+                raise ValueError(
+                    "No se pudieron seleccionar suficientes "
+                    "repeticiones para la inferencia."
+                )
 
-                    percentage -= 0.05
-                    continue
+            reference_shift = imageset_shift[0].copy()
+
+            imageset = imageset[selected]
+            imageset_mask = imageset_mask[selected]
+            imageset_shift = (
+                imageset_shift[selected] - reference_shift
+            )
 
             len_imageset = np.shape(imageset)[0]
 
@@ -1566,24 +1746,40 @@ class SR_network(object):
             SR_imageset = np.zeros([size, 1, hiresl_h, hiresl_w, 1])
             for n in range(0, size):
 
-                imageset_9 = imageset[n:n + temporal_dim]
+                # Todas las ventanas conservan la referencia 0.
+                window = np.concatenate(
+                    ([0], np.arange(n + 1, n + temporal_dim))
+                )
+
+                imageset_9 = imageset[window]
                 imageset_9 = np.expand_dims(imageset_9, axis=0)
                 imageset_9 = np.expand_dims(imageset_9, axis=-1)
 
-                imageset_9_mask = imageset_mask[n:n + temporal_dim]
-                imageset_9_mask = np.expand_dims(imageset_9_mask, axis=0)
-                imageset_9_mask = np.expand_dims(imageset_9_mask, axis=-1)
+                imageset_9_mask = imageset_mask[window]
+                imageset_9_mask = np.expand_dims(
+                    imageset_9_mask, axis=0
+                )
+                imageset_9_mask = np.expand_dims(
+                    imageset_9_mask, axis=-1
+                )
+
+                imageset_9_shift = imageset_shift[window]
 
                 imageset_9_mask = np.round(imageset_9_mask)
                 imageset_9_mask = imageset_9_mask.astype('bool')
 
                 for j in range(imageset_9_mask.shape[1]):
                     shifted_mask = imageset_9_mask[:, j]
-                    corrected_mask = fourier_shift(np.fft.fftn(shifted_mask.squeeze()), imageset_shift[j])
+                    corrected_mask = fourier_shift(
+                        np.fft.fftn(shifted_mask.squeeze()),
+                        imageset_9_shift[j],
+                    )
                     corrected_mask = np.fft.ifftn(corrected_mask)
                     corrected_mask = corrected_mask.reshape(
                         [1, np.shape(corrected_mask)[0], np.shape(corrected_mask)[1], 1])
-                    imageset_9_mask[:, j] = np.round(corrected_mask)
+                    imageset_9_mask[:, j] = np.rint(
+                        corrected_mask.real
+                    ).astype(bool)
 
                 sh = imageset_9_mask.shape
                 fill_coeff_test = np.ones([sh[0], sh[1], sh[1], sh[2], sh[3], sh[4]], dtype='bool')

@@ -142,12 +142,39 @@ class SplitData:
     shifts: list[np.ndarray] | None = None
 
 
-def lr_volume_to_imagesets(volume: np.ndarray, dtype=np.uint16) -> np.ndarray:
-    return np.transpose(volume, (2, 3, 0, 1)).astype(dtype)
+def lr_volume_to_imagesets(
+    volume: np.ndarray,
+    dtype=np.float32,
+) -> np.ndarray:
+    volume = np.asarray(volume)
+    if volume.ndim != 4 or np.iscomplexobj(volume):
+        raise ValueError(
+            "LR volumes must be real [H, W, sets, repetitions] arrays."
+        )
+    if not np.issubdtype(np.dtype(dtype), np.floating):
+        raise ValueError("LR output dtype must be floating point.")
+
+    imagesets = np.transpose(
+        volume, (2, 3, 0, 1)
+    ).astype(dtype, copy=False)
+
+    if not np.isfinite(imagesets).all():
+        raise ValueError("LR volume contains non-finite values.")
+    return imagesets
 
 
 def hr_volume_to_imagesets(volume: np.ndarray) -> np.ndarray:
-    return np.transpose(volume, (2, 0, 1))
+    volume = np.asarray(volume)
+    if volume.ndim != 3 or np.iscomplexobj(volume):
+        raise ValueError("HR volumes must be real [H, W, sets] arrays.")
+
+    imagesets = np.transpose(
+        volume, (2, 0, 1)
+    ).astype(np.float32, copy=False)
+
+    if not np.isfinite(imagesets).all():
+        raise ValueError("HR volume contains non-finite values.")
+    return imagesets
 
 
 def load_dwi_data(mat_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
